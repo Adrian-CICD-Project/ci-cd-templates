@@ -1,0 +1,54 @@
+name: Validate Kubernetes Manifests
+
+on:
+    workflow_call:
+        inputs:
+            app-name:
+                required: true
+                type: string
+                description: "Application name (e.g., devops-project)"
+            manifests:
+                required: false
+                type: string
+                default: "deployment.yaml,service.yaml"
+                description: "Comma-separated list of manifest files to validate"
+
+jobs:
+    validate:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v4
+
+            - name: Validate Kubernetes manifests (YAML syntax)
+              shell: python
+              run: |
+                  import yaml
+                  import pathlib
+                  import sys
+
+                  app_name = "${{ inputs.app-name }}"
+                  manifests = "${{ inputs.manifests }}".split(",")
+
+                  files = [f"k8s/{app_name}/{m.strip()}" for m in manifests]
+
+                  errors = []
+                  for path in files:
+                      p = pathlib.Path(path)
+                      if not p.exists():
+                          print(f"[SKIP] {path} - file not found")
+                          continue
+                      try:
+                          with p.open() as f:
+                              yaml.safe_load(f)
+                          print(f"[OK] {path}")
+                      except Exception as e:
+                          print(f"[ERROR] {path}: {e}")
+                          errors.append(path)
+
+                  if errors:
+                      print(f"\n❌ Validation failed for {len(errors)} file(s)")
+                      sys.exit(1)
+                  else:
+                      print(f"\n✅ All {len(files)} manifests validated successfully")

@@ -1,0 +1,108 @@
+name: Promote Environment
+
+on:
+    workflow_call:
+        inputs:
+            app-name:
+                required: true
+                type: string
+                description: "Application name (e.g., devops-project)"
+            source-env:
+                required: true
+                type: string
+                description: "Source environment (dev, test)"
+            target-env:
+                required: true
+                type: string
+                description: "Target environment (test, prod)"
+            target-repo:
+                required: true
+                type: string
+                description: "Target repository (e.g., org/infrastructure-env-test)"
+            acr-repo:
+                required: true
+                type: string
+                description: "ACR repository URL (e.g., myacr.azurecr.io/app-name)"
+        secrets:
+            ENV_REPOS_TOKEN:
+                required: true
+
+permissions:
+    contents: write
+    pull-requests: write
+
+jobs:
+    promote:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout source environment repo
+              uses: actions/checkout@v4
+
+            - name: Checkout target environment repo
+              uses: actions/checkout@v4
+              with:
+                  repository: ${{ inputs.target-repo }}
+                  token: ${{ secrets.ENV_REPOS_TOKEN }}
+                  path: env-target
+
+            - name: Copy image tag from source to target
+              shell: bash
+              run: |
+                  SOURCE_FILE="values/${{ inputs.app-name }}/values.yaml"
+                  TARGET_FILE="env-target/values/${{ inputs.app-name }}/values.yaml"
+
+                  # Extract tag from source (value in quotes)
+                  TAG=$(awk -F'"' '/tag:/ {print $2; exit}' "$SOURCE_FILE")
+                  echo "TAG from ${{ inputs.source-env }}: $TAG"
+
+                  if [ -z "$TAG" ]; then
+                    echo "❌ ERROR: TAG is empty. Check values/${{ inputs.app-name }}/values.yaml in source."
+                    exit 1
+                  fi
+
+                  # Update tag in target values.yaml
+                  awk -v newtag="$TAG" '
+                    $1 == "tag:" || /^  tag:/ {
+                      print "  tag: \"" newtag "\""
+                      next
+                    }
+                    { print }
+                  ' "$TARGET_FILE" > "${TARGET_FILE}.tmp"
+
+                  mv "${TARGET_FILE}.tmp" "$TARGET_FILE"
+                  echo "Updated tag in $TARGET_FILE to $TAG"
+
+            - name: Update image in target deployment
+              shell: bash
+              run: |
+                  TARGET_VALUES="env-target/values/${{ inputs.app-name }}/values.yaml"
+                  TARGET_DEPLOY="env-target/k8s/${{ inputs.app-name }}/deployment.yaml"
+                  REPO="${{ inputs.acr-repo }}"
+
+                  TAG=$(awk -F'"' '/tag:/ {print $2; exit}' "$TARGET_VALUES")
+                  echo "Using image for ${{ inputs.target-env }}: $REPO:$TAG"
+
+                  awk -v image="$REPO:$TAG" '
+                    /^[[:space:]]*image:/ {
+                      sub(/image:.*/, "image: " image)
+                      print
+                      next
+                    }
+                    { print }
+                  ' "$TARGET_DEPLOY" > "${TARGET_DEPLOY}.tmp"
+
+                  mv "${TARGET_DEPLOY}.tmp" "$TARGET_DEPLOY"
+                  echo "Updated image in $TARGET_DEPLOY to $REPO:$TAG"
+
+            - name: Create Pull Request to target environment
+              uses: peter-evans/create-pull-request@v7
+              with:
+                  token: ${{ secrets.ENV_REPOS_TOKEN }}
+                  path: env-target
+                  commit-message: "Promote ${{ inputs.app-name }} from ${{ inputs.source-env }} to ${{ inputs.target-env }}"
+                  branch: "feature/${{ inputs.app-name }}-${{ inputs.target-env }}"
+                  title: "Promote ${{ inputs.app-name }} to ${{ inputs.target-env }}"
+                  body: |
+                      Automatic promotion of image tag from **${{ inputs.source-env }}** to **${{ inputs.target-env }}**.
+                      After merge, ArgoCD will perform rollout to `environment-${{ inputs.target-env }}`.
