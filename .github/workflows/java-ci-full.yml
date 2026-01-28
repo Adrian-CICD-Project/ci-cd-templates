@@ -1,0 +1,376 @@
+name: Java CI/CD Pipeline
+
+on:
+    workflow_call:
+        inputs:
+            image-name:
+                required: true
+                type: string
+                description: "Docker image name (e.g., devops-project)"
+            java-version:
+                required: false
+                default: "21"
+                type: string
+                description: "Java version to use"
+            env-repo:
+                required: true
+                type: string
+                description: "Environment repo for promotion (e.g., org/infrastructure-env-dev)"
+        secrets:
+            SONAR_TOKEN:
+                required: true
+            SONAR_HOST_URL:
+                required: true
+            ACR_NAME:
+                required: true
+            AZURE_CREDENTIALS:
+                required: true
+            DTRACK_API_URL:
+                required: true
+            DEPENDENCY_TRACK_API_KEY:
+                required: true
+            ENV_REPOS_TOKEN:
+                required: true
+
+permissions:
+    contents: write
+    actions: read
+    pull-requests: write
+
+jobs:
+    build-test:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Set up JDK ${{ inputs.java-version }}
+              uses: actions/setup-java@v4
+              with:
+                  java-version: ${{ inputs.java-version }}
+                  distribution: "temurin"
+
+            - name: Cache Maven
+              uses: actions/cache@v4
+              with:
+                  path: ~/.m2
+                  key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+                  restore-keys: |
+                      ${{ runner.os }}-m2-
+
+            - name: Build and test
+              run: mvn clean verify
+
+            - name: Upload JUnit reports
+              uses: actions/upload-artifact@v4
+              with:
+                  name: junit-report
+                  path: target/surefire-reports
+
+    sonar:
+        runs-on: ubuntu-latest
+        needs: build-test
+
+        env:
+            SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+            SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up JDK ${{ inputs.java-version }}
+              uses: actions/setup-java@v4
+              with:
+                  java-version: ${{ inputs.java-version }}
+                  distribution: "temurin"
+
+            - name: Cache Maven
+              uses: actions/cache@v4
+              with:
+                  path: ~/.m2
+                  key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+                  restore-keys: |
+                      ${{ runner.os }}-m2-
+
+            - name: Cache SonarQube packages
+              uses: actions/cache@v4
+              with:
+                  path: ~/.sonar/cache
+                  key: ${{ runner.os }}-sonar
+                  restore-keys: ${{ runner.os }}-sonar
+
+            - name: Build, test & SonarQube
+              run: |
+                  mvn -B clean verify sonar:sonar \
+                    -Dsonar.host.url=${SONAR_HOST_URL} \
+                    -Dsonar.token=${SONAR_TOKEN}
+
+            - name: Wait for SonarQube Analysis
+              run: sleep 10
+
+            - name: Check SonarQube Quality Gate
+              run: |
+                  # Get project key from pom.xml
+                  PROJECT_KEY=$(mvn help:evaluate -Dexpression=project.artifactId -q -DforceStdout)
+
+                  echo "Checking Quality Gate for project: $PROJECT_KEY"
+
+                  # Get Quality Gate status from SonarQube API
+                  RESPONSE=$(curl -s -u "${SONAR_TOKEN}:" \
+                    "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${PROJECT_KEY}")
+
+                  STATUS=$(echo "$RESPONSE" | jq -r '.projectStatus.status')
+                  echo "Quality Gate Status: $STATUS"
+
+                  if [ "$STATUS" != "OK" ]; then
+                    echo "❌ Quality Gate FAILED!"
+                    echo "Full response:"
+                    echo "$RESPONSE" | jq '.'
+                    exit 1
+                  fi
+
+                  echo "✅ Quality Gate PASSED!"
+
+    build-and-push-image:
+        runs-on: ubuntu-latest
+        needs: build-test
+
+        outputs:
+            IMAGE_TAG: ${{ steps.set-image-tag.outputs.IMAGE_TAG }}
+            VERSION: ${{ steps.set-image-tag.outputs.VERSION }}
+
+        env:
+            ACR_NAME: ${{ secrets.ACR_NAME }}
+            IMAGE_NAME: ${{ inputs.image-name }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Azure login (service principal)
+              uses: azure/login@v2
+              with:
+                  creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+            - name: Calculate semantic version
+              id: set-image-tag
+              run: |
+                  # Get the latest tag in 1.0.x format
+                  LAST_TAG=$(git tag --list '1.0.*' --sort=-version:refname | head -n 1)
+
+                  if [ -z "$LAST_TAG" ]; then
+                    # No tags found - start from 1.0.0
+                    NEW_VERSION="1.0.0"
+                  else
+                    # Extract patch number and increment by 1
+                    PATCH=$(echo "$LAST_TAG" | cut -d. -f3)
+                    NEW_PATCH=$((PATCH + 1))
+                    NEW_VERSION="1.0.${NEW_PATCH}"
+                  fi
+
+                  echo "Previous tag: ${LAST_TAG:-none}"
+                  echo "New version: ${NEW_VERSION}"
+
+                  echo "IMAGE_TAG=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+                  echo "VERSION=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+
+            - name: Login to ACR
+              run: az acr login --name "${ACR_NAME}"
+
+            - name: Build Docker image
+              run: |
+                  IMAGE_TAG=${{ steps.set-image-tag.outputs.IMAGE_TAG }}
+                  docker build -t ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG} .
+
+            - name: Push Docker image
+              run: |
+                  IMAGE_TAG=${{ steps.set-image-tag.outputs.IMAGE_TAG }}
+                  docker push ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}
+
+    release-and-security:
+        runs-on: ubuntu-latest
+        needs: [build-and-push-image, sonar]
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+        env:
+            ACR_NAME: ${{ secrets.ACR_NAME }}
+            IMAGE_NAME: ${{ inputs.image-name }}
+            IMAGE_TAG: ${{ needs.build-and-push-image.outputs.IMAGE_TAG }}
+            VERSION: ${{ needs.build-and-push-image.outputs.VERSION }}
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Azure login (service principal)
+              uses: azure/login@v2
+              with:
+                  creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+            - name: Login to ACR
+              run: az acr login --name "${ACR_NAME}"
+
+            - name: Pull image for scanning
+              run: |
+                  docker pull ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}
+
+            - name: Generate SBOM
+              run: |
+                  mvn -DskipTests org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
+
+            - name: Upload SBOM to Dependency-Track
+              env:
+                  DTRACK_API_URL: ${{ secrets.DTRACK_API_URL }}
+                  DTRACK_API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
+              run: |
+                  echo "Debug - Checking environment variables..."
+
+                  # Check if variables are set (without showing values)
+                  if [ -z "$DTRACK_API_URL" ]; then
+                    echo "❌ ERROR: DTRACK_API_URL is empty or not set!"
+                    echo "Available secrets: ${{ toJson(secrets) }}"
+                    exit 1
+                  fi
+
+                  if [ -z "$DTRACK_API_KEY" ]; then
+                    echo "❌ ERROR: DTRACK_API_KEY is empty or not set!"
+                    exit 1
+                  fi
+
+                  echo "✅ DTRACK_API_URL is set: ${DTRACK_API_URL}"
+                  echo "✅ DTRACK_API_KEY is set (length: $(echo -n "$DTRACK_API_KEY" | wc -c) chars)"
+                  echo "🔑 Key starts with: $(echo "$DTRACK_API_KEY" | cut -c1-12)..."
+
+                  # Check if SBOM file exists
+                  if [ ! -f "target/bom.json" ]; then
+                    echo "ERROR: SBOM file not found at target/bom.json"
+                    echo "Files in target/:"
+                    ls -lah target/ || echo "target/ directory does not exist"
+                    exit 1
+                  fi
+
+                  echo "✅ SBOM file exists: $(wc -c < target/bom.json) bytes"
+
+                  # Test connection
+                  echo ""
+                  echo "🔌 Testing connection to DependencyTrack..."
+                  curl -f -s "${DTRACK_API_URL}/version" || {
+                    echo "❌ Cannot connect to ${DTRACK_API_URL}/version"
+                    exit 1
+                  }
+                  echo "✅ Connection OK"
+
+                  # Upload SBOM
+                  echo ""
+                  echo "📤 Uploading SBOM..."
+                  HTTP_CODE=$(curl -w "%{http_code}" -o response.json -s \
+                    -X POST \
+                    "${DTRACK_API_URL}/v1/bom" \
+                    -H "X-Api-Key: ${DTRACK_API_KEY}" \
+                    -H "Content-Type: multipart/form-data" \
+                    -F "projectName=${{ inputs.image-name }}" \
+                    -F "projectVersion=${IMAGE_TAG}" \
+                    -F "autoCreate=true" \
+                    -F "bom=@target/bom.json")
+
+                  echo "📊 HTTP Status Code: $HTTP_CODE"
+                  echo "📄 Response:"
+                  cat response.json
+                  echo ""
+
+                  # Check result
+                  if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
+                    echo "✅ SBOM uploaded successfully!"
+                    TOKEN=$(cat response.json | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+                    echo "🎫 Upload token: $TOKEN"
+                  else
+                    echo "❌ Upload failed with HTTP $HTTP_CODE"
+                    exit 1
+                  fi
+
+            - name: Trivy scan
+              uses: aquasecurity/trivy-action@0.28.0
+              with:
+                  image-ref: "${{ secrets.ACR_NAME }}.azurecr.io/${{ inputs.image-name }}:${{ env.IMAGE_TAG }}"
+                  format: "table"
+                  output: "trivy-report.txt"
+
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: ${{ env.VERSION }}
+                  name: "Release ${{ env.VERSION }}"
+                  body: |
+                      ## Release ${{ env.VERSION }}
+
+                      ### Docker Image
+                      `${{ secrets.ACR_NAME }}.azurecr.io/${{ inputs.image-name }}:${{ env.IMAGE_TAG }}`
+
+                      ### Attached Reports
+                      - **bom.json** - Software Bill of Materials (SBOM)
+                      - **trivy-report.txt** - Trivy Security Report
+                  files: |
+                      target/bom.json
+                      trivy-report.txt
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    promote-to-dev:
+        runs-on: ubuntu-latest
+        needs: [build-and-push-image, sonar, release-and-security]
+
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+        permissions:
+            contents: write
+            pull-requests: write
+
+        steps:
+            - name: Checkout env-dev repo
+              uses: actions/checkout@v4
+              with:
+                  repository: ${{ inputs.env-repo }}
+                  token: ${{ secrets.ENV_REPOS_TOKEN }}
+                  path: env-dev
+
+            - name: Update image tag in env-dev values
+              run: |
+                  VERSION="${{ needs.build-and-push-image.outputs.IMAGE_TAG }}"
+                  FILE="env-dev/values/${{ inputs.image-name }}/values.yaml"
+                  sed -i "s/^  tag: \".*\"/  tag: \"${VERSION}\"/" "$FILE"
+                  echo "Updated tag in $FILE to $VERSION"
+
+            - name: Update image in env-dev deployment
+              env:
+                  ACR_NAME: ${{ secrets.ACR_NAME }}
+              shell: bash
+              run: |
+                  DEV_DEPLOY="env-dev/k8s/${{ inputs.image-name }}/deployment.yaml"
+                  REPO="${ACR_NAME}.azurecr.io/${{ inputs.image-name }}"
+                  TAG="${{ needs.build-and-push-image.outputs.IMAGE_TAG }}"
+
+                  awk -v image="$REPO:$TAG" '
+                    /^[[:space:]]*image:/ {
+                      sub(/image:.*/, "image: " image)
+                      print
+                      next
+                    }
+                    { print }
+                  ' "$DEV_DEPLOY" > "${DEV_DEPLOY}.tmp"
+
+                  mv "${DEV_DEPLOY}.tmp" "$DEV_DEPLOY"
+
+            - name: Create Pull Request to env-dev
+              uses: peter-evans/create-pull-request@v7
+              with:
+                  token: ${{ secrets.ENV_REPOS_TOKEN }}
+                  path: env-dev
+                  commit-message: "Promote ${{ inputs.image-name }} to ${{ needs.build-and-push-image.outputs.IMAGE_TAG }} (dev)"
+                  branch: "feature/${{ inputs.image-name }}-${{ needs.build-and-push-image.outputs.IMAGE_TAG }}-dev"
+                  title: "Promote ${{ inputs.image-name }} to ${{ needs.build-and-push-image.outputs.IMAGE_TAG }} (dev)"
+                  body: |
+                      Automatic promotion of version `${{ needs.build-and-push-image.outputs.IMAGE_TAG }}` to **dev** environment.
+                      After merge, ArgoCD (auto-sync) will perform rollout to `environment-dev`.
