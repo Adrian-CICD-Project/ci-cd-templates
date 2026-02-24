@@ -87,3 +87,11 @@ jobs:
 | `infrastructure-env-dev` | DEV environment configuration |
 | `infrastructure-env-test` | TEST environment configuration |
 | `infrastructure-env-prod` | PROD environment configuration |
+
+---
+
+## Security Notes
+
+- CI workflows do **not** log secrets or tokens to GitHub Actions output
+- Workflow permissions follow least-privilege principle
+- All sensitive data is managed via GitHub Secrets (CI) and Azure Key Vault (runtime)
