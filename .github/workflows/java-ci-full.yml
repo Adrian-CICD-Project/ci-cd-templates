@@ -233,7 +233,6 @@ jobs:
           # Check if variables are set (without showing values)
           if [ -z "$DTRACK_API_URL" ]; then
             echo "❌ ERROR: DTRACK_API_URL is empty or not set!"
-            echo "Available secrets: ${{ toJson(secrets) }}"
             exit 1
           fi
 
@@ -244,7 +243,6 @@ jobs:
 
           echo "✅ DTRACK_API_URL is set: ${DTRACK_API_URL}"
           echo "✅ DTRACK_API_KEY is set (length: $(echo -n "$DTRACK_API_KEY" | wc -c) chars)"
-          echo "🔑 Key starts with: $(echo "$DTRACK_API_KEY" | cut -c1-12)..."
 
           # Check if SBOM file exists
           if [ ! -f "target/bom.json" ]; then
@@ -286,8 +284,6 @@ jobs:
           # Check result
           if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
             echo "✅ SBOM uploaded successfully!"
-            TOKEN=$(cat response.json | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
-            echo "🎫 Upload token: $TOKEN"
           else
             echo "❌ Upload failed with HTTP $HTTP_CODE"
             exit 1
