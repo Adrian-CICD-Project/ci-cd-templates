@@ -241,8 +241,8 @@ jobs:
             exit 1
           fi
 
-          echo "✅ DTRACK_API_URL is set: ${DTRACK_API_URL}"
-          echo "✅ DTRACK_API_KEY is set (length: $(echo -n "$DTRACK_API_KEY" | wc -c) chars)"
+          echo "✅ DTRACK_API_URL is set"
+          echo "✅ DTRACK_API_KEY is set"
 
           # Check if SBOM file exists
           if [ ! -f "target/bom.json" ]; then
@@ -277,9 +277,7 @@ jobs:
             -F "bom=@target/bom.json")
 
           echo "📊 HTTP Status Code: $HTTP_CODE"
-          echo "📄 Response:"
-          cat response.json
-          echo ""
+          echo "📄 Response status: $HTTP_CODE"
 
           # Check result
           if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
