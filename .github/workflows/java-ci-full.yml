@@ -228,45 +228,17 @@ jobs:
           DTRACK_API_URL: ${{ secrets.DTRACK_API_URL }}
           DTRACK_API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
         run: |
-          echo "Debug - Checking environment variables..."
+          set -e
 
-          # Check if variables are set (without showing values)
-          if [ -z "$DTRACK_API_URL" ]; then
-            echo "❌ ERROR: DTRACK_API_URL is empty or not set!"
-            exit 1
-          fi
+          : "${DTRACK_API_URL:?DTRACK_API_URL not set}"
+          : "${DTRACK_API_KEY:?DTRACK_API_KEY not set}"
 
-          if [ -z "$DTRACK_API_KEY" ]; then
-            echo "❌ ERROR: DTRACK_API_KEY is empty or not set!"
-            exit 1
-          fi
-
-          echo "✅ DTRACK_API_URL is set"
-          echo "✅ DTRACK_API_KEY is set"
-
-          # Check if SBOM file exists
           if [ ! -f "target/bom.json" ]; then
-            echo "ERROR: SBOM file not found at target/bom.json"
-            echo "Files in target/:"
-            ls -lah target/ || echo "target/ directory does not exist"
+            echo "SBOM file not found at target/bom.json"
             exit 1
           fi
 
-          echo "✅ SBOM file exists: $(wc -c < target/bom.json) bytes"
-
-          # Test connection
-          echo ""
-          echo "🔌 Testing connection to DependencyTrack..."
-          curl -f -s "${DTRACK_API_URL}/version" || {
-            echo "❌ Cannot connect to ${DTRACK_API_URL}/version"
-            exit 1
-          }
-          echo "✅ Connection OK"
-
-          # Upload SBOM
-          echo ""
-          echo "📤 Uploading SBOM..."
-          HTTP_CODE=$(curl -w "%{http_code}" -o response.json -s \
+          HTTP_CODE=$(curl -w "%{http_code}" -o /dev/null -s \
             -X POST \
             "${DTRACK_API_URL}/v1/bom" \
             -H "X-Api-Key: ${DTRACK_API_KEY}" \
@@ -276,14 +248,10 @@ jobs:
             -F "autoCreate=true" \
             -F "bom=@target/bom.json")
 
-          echo "📊 HTTP Status Code: $HTTP_CODE"
-          echo "📄 Response status: $HTTP_CODE"
-
-          # Check result
           if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
-            echo "✅ SBOM uploaded successfully!"
+            echo "SBOM uploaded (HTTP $HTTP_CODE)"
           else
-            echo "❌ Upload failed with HTTP $HTTP_CODE"
+            echo "Upload failed (HTTP $HTTP_CODE)"
             exit 1
           fi
 
