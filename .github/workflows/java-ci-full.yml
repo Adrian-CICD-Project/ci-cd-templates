@@ -153,6 +153,7 @@ jobs:
           fetch-depth: 0
 
       - name: Azure login (service principal)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
@@ -180,6 +181,7 @@ jobs:
           echo "VERSION=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Login to ACR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: az acr login --name "${ACR_NAME}"
 
       - name: Build Docker image
@@ -187,7 +189,10 @@ jobs:
           IMAGE_TAG=${{ steps.set-image-tag.outputs.IMAGE_TAG }}
           docker build -t ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG} .
 
+      # Obrazy trafiają do ACR wyłącznie z main — każdy wypchnięty obraz
+      # przechodzi potem skan Trivy w jobie release-and-security.
       - name: Push Docker image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           IMAGE_TAG=${{ steps.set-image-tag.outputs.IMAGE_TAG }}
           docker push ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}
@@ -219,6 +224,16 @@ jobs:
         run: |
           docker pull ${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}
 
+      - name: Download JUnit test results
+        uses: actions/download-artifact@v4
+        with:
+          name: junit-report
+          path: junit-report
+
+      - name: Package JUnit test results
+        run: |
+          zip -r junit-test-results.zip junit-report
+
       - name: Generate SBOM
         run: |
           mvn -DskipTests org.cyclonedx:cyclonedx-maven-plugin:makeAggregateBom
@@ -238,7 +253,7 @@ jobs:
             exit 1
           fi
 
-          HTTP_CODE=$(curl -w "%{http_code}" -o /dev/null -s \
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
             -X POST \
             "${DTRACK_API_URL}/v1/bom" \
             -H "X-Api-Key: ${DTRACK_API_KEY}" \
@@ -248,19 +263,76 @@ jobs:
             -F "autoCreate=true" \
             -F "bom=@target/bom.json")
 
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
           if [ "$HTTP_CODE" -eq 200 ] || [ "$HTTP_CODE" -eq 201 ]; then
             echo "SBOM uploaded (HTTP $HTTP_CODE)"
+            echo "$BODY" | jq -r '.token // empty' > dtrack-token.txt
           else
             echo "Upload failed (HTTP $HTTP_CODE)"
             exit 1
           fi
 
-      - name: Trivy scan
+      - name: Export vulnerability findings from Dependency-Track
+        env:
+          DTRACK_API_URL: ${{ secrets.DTRACK_API_URL }}
+          DTRACK_API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
+        run: |
+          # Poczekaj aż Dependency-Track przetworzy SBOM (token z uploadu),
+          # potem pobierz raport podatności (FPF) jako asset do release'u.
+          TOKEN=$(cat dtrack-token.txt || echo "")
+
+          if [ -n "$TOKEN" ]; then
+            echo "Waiting for SBOM processing (token: $TOKEN)..."
+            for i in $(seq 1 18); do
+              PROCESSING=$(curl -s -H "X-Api-Key: ${DTRACK_API_KEY}" \
+                "${DTRACK_API_URL}/v1/event/token/${TOKEN}" | jq -r '.processing')
+              if [ "$PROCESSING" = "false" ]; then
+                echo "SBOM processed."
+                break
+              fi
+              sleep 10
+            done
+          fi
+
+          PROJECT_UUID=$(curl -s -H "X-Api-Key: ${DTRACK_API_KEY}" \
+            "${DTRACK_API_URL}/v1/project/lookup?name=${{ inputs.image-name }}&version=${IMAGE_TAG}" \
+            | jq -r '.uuid // empty')
+
+          if [ -z "$PROJECT_UUID" ]; then
+            echo "WARNING: project not found in Dependency-Track, attaching placeholder."
+            echo '{"warning": "Dependency-Track project lookup failed - check DTrack UI"}' > dtrack-findings.json
+            exit 0
+          fi
+
+          echo "Project UUID: $PROJECT_UUID"
+          curl -s -H "X-Api-Key: ${DTRACK_API_KEY}" \
+            "${DTRACK_API_URL}/v1/finding/project/${PROJECT_UUID}/export" \
+            -o dtrack-findings.json
+
+          FINDINGS=$(jq '.findings | length' dtrack-findings.json 2>/dev/null || echo "?")
+          echo "Exported $FINDINGS findings to dtrack-findings.json"
+
+      - name: Trivy scan (full report)
         uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: "${{ secrets.ACR_NAME }}.azurecr.io/${{ inputs.image-name }}:${{ env.IMAGE_TAG }}"
           format: "table"
           output: "trivy-report.txt"
+
+      # Bramka bezpieczeństwa: pipeline pada przy podatnościach CRITICAL
+      # z dostępną poprawką. Pełny raport (wyżej) obejmuje wszystkie poziomy.
+      - name: Trivy scan (gate on CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "${{ secrets.ACR_NAME }}.azurecr.io/${{ inputs.image-name }}:${{ env.IMAGE_TAG }}"
+          format: "table"
+          severity: "CRITICAL"
+          ignore-unfixed: true
+          exit-code: "1"
+        env:
+          TRIVY_SKIP_DB_UPDATE: "true"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -275,10 +347,14 @@ jobs:
 
             ### Attached Reports
             - **bom.json** - Software Bill of Materials (SBOM)
+            - **dtrack-findings.json** - Dependency-Track vulnerability findings
             - **trivy-report.txt** - Trivy Security Report
+            - **junit-test-results.zip** - Unit test results (Surefire)
           files: |
             target/bom.json
+            dtrack-findings.json
             trivy-report.txt
+            junit-test-results.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

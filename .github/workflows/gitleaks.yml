@@ -1,0 +1,23 @@
+name: Gitleaks Secret Scan
+
+on:
+  workflow_call: {}
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        run: |
+          GITLEAKS_VERSION=8.21.2
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+
+          # --redact: nie wypisuj wykrytych sekretów w logach CI
+          ./gitleaks detect --source . --redact --verbose
