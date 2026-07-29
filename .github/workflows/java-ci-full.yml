@@ -315,7 +315,7 @@ jobs:
           echo "Exported $FINDINGS findings to dtrack-findings.json"
 
       - name: Trivy scan (full report)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
           image-ref: "${{ secrets.ACR_NAME }}.azurecr.io/${{ inputs.image-name }}:${{ env.IMAGE_TAG }}"
           format: "table"
@@ -324,7 +324,7 @@ jobs:
       # Bramka bezpieczeństwa: pipeline pada przy podatnościach CRITICAL
       # z dostępną poprawką. Pełny raport (wyżej) obejmuje wszystkie poziomy.
       - name: Trivy scan (gate on CRITICAL)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
         with:
           image-ref: "${{ secrets.ACR_NAME }}.azurecr.io/${{ inputs.image-name }}:${{ env.IMAGE_TAG }}"
           format: "table"
